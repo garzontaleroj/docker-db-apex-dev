@@ -24,12 +24,7 @@ export ORACLE_HOME ORACLE_BASE ORACLE_SID
 
 # Helper: run SQL as SYS DBA via gosu oracle
 run_sql_sys() {
-    gosu oracle bash -c ". /.oracle_env && echo \"$1\" | \${ORACLE_HOME}/bin/sqlplus -s -l / as sysdba"
-}
-
-# Helper: run SQL script as SYS DBA via gosu oracle
-run_sql_sys_script() {
-    gosu oracle bash -c ". /.oracle_env && cd $1 && echo EXIT | \${ORACLE_HOME}/bin/sqlplus -s -l / as sysdba @$2"
+    gosu oracle bash -c ". /.oracle_env && echo \"$1\" | \${ORACLE_HOME}/bin/sqlplus -s / as sysdba"
 }
 
 # Helper: run SQL as a specific user via gosu oracle
@@ -37,16 +32,7 @@ run_sql_user() {
     local user=$1
     local pass=$2
     local sql=$3
-    gosu oracle bash -c ". /.oracle_env && echo \"$sql\" | \${ORACLE_HOME}/bin/sqlplus -s -l ${user}/${pass}"
-}
-
-# Helper: run SQL script as a specific user via gosu oracle
-run_sql_user_script() {
-    local user=$1
-    local pass=$2
-    local dir=$3
-    local script=$4
-    gosu oracle bash -c ". /.oracle_env && cd ${dir} && echo EXIT | \${ORACLE_HOME}/bin/sqlplus -s -l ${user}/${pass} @${script}"
+    gosu oracle bash -c ". /.oracle_env && echo \"$sql\" | \${ORACLE_HOME}/bin/sqlplus -s ${user}/${pass}"
 }
 
 # ---------------------------------------------------
@@ -61,7 +47,11 @@ gosu oracle bash -c ". /.oracle_env && \${ORACLE_HOME}/bin/dbca -silent -createD
   -templateName General_Purpose.dbc \
   -gdbname ${SERVICE_NAME} -sid ${ORACLE_SID} -responseFile NO_VALUE -characterSet AL32UTF8 \
   -datafileDestination \${ORACLE_BASE}/oradata/ -totalMemory ${DBCA_TOTAL_MEMORY} \
-  -emConfiguration NONE -sysPassword ${PASS} -systemPassword ${PASS}"
+  -emConfiguration NONE -sysPassword ${PASS} -systemPassword ${PASS}" || true
+
+# Verify database was actually created
+gosu oracle bash -c ". /.oracle_env && echo 'SELECT status FROM v\$instance;' | \${ORACLE_HOME}/bin/sqlplus -s -l / as sysdba" | grep -qi OPEN
+echo "Database instance verified OPEN."
 
 # Configure listener registration
 run_sql_sys "ALTER SYSTEM SET LOCAL_LISTENER='(ADDRESS = (PROTOCOL = TCP)(HOST = $(hostname))(PORT = 1521))' SCOPE=BOTH;"
@@ -80,7 +70,28 @@ if [ "${INSTALL_APEX}" == "true" ]; then
     echo "--------------------------------------------------"
     echo "Installing APEX..................................."
 
-    # APEX files were pre-extracted to ${ORACLE_HOME}/apex during build
+    # Resolve the real path (follows symlinks)
+    ORACLE_HOME_REAL=$(readlink -f ${ORACLE_HOME})
+    APEX_DIR="${ORACLE_HOME_REAL}/apex"
+
+    # Verify APEX files exist
+    echo "Checking APEX directory: ${APEX_DIR}"
+    if [ ! -d "${APEX_DIR}" ]; then
+        echo "ERROR: APEX directory not found at ${APEX_DIR}"
+        echo "Listing ${ORACLE_HOME_REAL}/:"
+        ls -la ${ORACLE_HOME_REAL}/ | head -20
+        exit 1
+    fi
+    echo "APEX directory contents (top-level):"
+    ls ${APEX_DIR}/*.sql 2>/dev/null | head -10 || echo "  (no .sql files found!)"
+
+    if [ ! -f "${APEX_DIR}/apexins.sql" ]; then
+        echo "ERROR: apexins.sql not found in ${APEX_DIR}"
+        echo "Full listing:"
+        ls -la ${APEX_DIR}/
+        exit 1
+    fi
+
     # Disable HTTP on XDB
     run_sql_sys "EXEC DBMS_XDB.SETHTTPPORT(0);"
 
@@ -88,41 +99,52 @@ if [ "${INSTALL_APEX}" == "true" ]; then
     DATAFILE_SID=${ORACLE_SID^^}
     run_sql_sys "CREATE TABLESPACE apex DATAFILE '${ORACLE_BASE}/oradata/${DATAFILE_SID}/apex01.dbf' SIZE 100M AUTOEXTEND ON NEXT 10M;"
 
-    # Install APEX
-    echo "Running apexins.sql (this takes several minutes)..."
-    gosu oracle bash -c ". /.oracle_env && cd \${ORACLE_HOME}/apex && echo EXIT | \${ORACLE_HOME}/bin/sqlplus -s -l / as sysdba @apexins APEX APEX TEMP /i/"
+    # Install APEX — NO piped stdin, NO -s/-l flags
+    # apexins.sql has its own EXIT; redirect stdin from /dev/null
+    echo "Running apexins.sql (this takes 10-20 minutes)..."
+    gosu oracle bash -c ". /.oracle_env && cd ${APEX_DIR} && \${ORACLE_HOME}/bin/sqlplus / as sysdba @apexins.sql APEX APEX TEMP /i/" < /dev/null
 
-    # Change APEX admin password
-    echo "Setting APEX admin password..."
-    APEX_SCHEMA=$(gosu oracle bash -c ". /.oracle_env && \${ORACLE_HOME}/bin/sqlplus -s -l / as sysdba <<EOF
-SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+    # Verify APEX was installed
+    echo "Verifying APEX installation..."
+    APEX_SCHEMA=$(gosu oracle bash -c ". /.oracle_env && \${ORACLE_HOME}/bin/sqlplus -s / as sysdba <<EOF
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF TRIMSPOOL ON
 SELECT ao.owner FROM all_objects ao WHERE ao.object_name = 'WWV_FLOW' AND ao.object_type = 'PACKAGE' AND ao.owner LIKE 'APEX_%';
 EXIT;
 EOF" | tr -d '[:space:]')
 
-    gosu oracle bash -c ". /.oracle_env && cd \${ORACLE_HOME}/apex && \${ORACLE_HOME}/bin/sqlplus -s -l / as sysdba <<EOSQL
+    if [ -z "${APEX_SCHEMA}" ]; then
+        echo "ERROR: APEX installation failed — no APEX schema found."
+        echo "Checking for any APEX-related users..."
+        run_sql_sys "SELECT username FROM dba_users WHERE username LIKE 'APEX%';"
+        exit 1
+    fi
+    echo "APEX schema detected: ${APEX_SCHEMA}"
+
+    # Change APEX admin password
+    echo "Setting APEX admin password..."
+    gosu oracle bash -c ". /.oracle_env && \${ORACLE_HOME}/bin/sqlplus -s / as sysdba <<EOSQL
 ALTER SESSION SET CURRENT_SCHEMA=${APEX_SCHEMA};
-begin
+BEGIN
     wwv_flow_security.g_security_group_id := 10;
     wwv_flow_security.g_user              := 'admin';
     wwv_flow_fnd_user_int.create_or_update_user( p_user_id  => NULL,
                                                  p_username => 'admin',
                                                  p_email    => 'admin',
                                                  p_password => '${APEX_PASS}' );
-    commit;
-end;
+    COMMIT;
+END;
 /
 EXIT;
 EOSQL"
 
-    # Configure APEX REST users
+    # Configure APEX REST users — apex_rest_config needs passwords on stdin
     echo "Configuring APEX REST users..."
-    gosu oracle bash -c ". /.oracle_env && cd \${ORACLE_HOME}/apex && echo -e '${PASS}\n${PASS}' | \${ORACLE_HOME}/bin/sqlplus -s -l / as sysdba @apex_rest_config.sql"
+    gosu oracle bash -c ". /.oracle_env && cd ${APEX_DIR} && printf '%s\n%s\n' '${PASS}' '${PASS}' | \${ORACLE_HOME}/bin/sqlplus -s / as sysdba @apex_rest_config.sql"
     run_sql_sys "ALTER USER APEX_PUBLIC_USER ACCOUNT UNLOCK;"
     run_sql_sys "ALTER USER APEX_PUBLIC_USER IDENTIFIED BY ${PASS};"
 
     # Create network ACL
-    gosu oracle bash -c ". /.oracle_env && \${ORACLE_HOME}/bin/sqlplus -s -l / as sysdba <<EOSQL
+    gosu oracle bash -c ". /.oracle_env && \${ORACLE_HOME}/bin/sqlplus -s / as sysdba <<EOSQL
 BEGIN
   BEGIN
     dbms_network_acl_admin.drop_acl(acl => 'all-network-PUBLIC.xml');
@@ -146,9 +168,12 @@ EXIT;
 EOSQL"
 
     # Load APEX images
-    echo "Loading APEX images..."
-    ORACLE_HOME_REAL=$(readlink -f ${ORACLE_HOME})
-    gosu oracle bash -c ". /.oracle_env && cd \${ORACLE_HOME}/apex && echo EXIT | \${ORACLE_HOME}/bin/sqlplus -s -l / as sysdba @apxldimg.sql ${ORACLE_HOME_REAL}"
+    if [ -f "${APEX_DIR}/apxldimg.sql" ]; then
+        echo "Loading APEX images..."
+        gosu oracle bash -c ". /.oracle_env && cd ${APEX_DIR} && \${ORACLE_HOME}/bin/sqlplus / as sysdba @apxldimg.sql ${ORACLE_HOME_REAL}" < /dev/null
+    else
+        echo "WARNING: apxldimg.sql not found — skipping image load"
+    fi
 
     echo "APEX installation completed."
 
@@ -160,8 +185,9 @@ EOSQL"
 
     # ORDS was pre-extracted to ${ORDS_HOME} during build
     # Install ORDS into database (silent mode)
+    # --proxy-user + --password-stdin requires TWO passwords: admin then proxy user
     cd ${ORDS_HOME}
-    gosu oracle bash -c ". /.oracle_env && cd ${ORDS_HOME} && echo '${PASS}' | ${ORDS_HOME}/bin/ords --config ${ORDS_CONFIG} install \
+    gosu oracle bash -c ". /.oracle_env && cd ${ORDS_HOME} && printf '%s\n%s\n' '${PASS}' '${PASS}' | ${ORDS_HOME}/bin/ords --config ${ORDS_CONFIG} install \
       --admin-user SYS \
       --db-hostname localhost \
       --db-port 1521 \
@@ -270,3 +296,13 @@ gosu oracle bash -c ". /.oracle_env && \${ORACLE_HOME}/bin/lsnrctl stop" || true
 
 # ---------------------------------------------------
 # 8. Cleanup and mark complete
+# ---------------------------------------------------
+echo "--------------------------------------------------"
+echo "Cleaning up installation files..."
+rm -f /files/*.zip 2>/dev/null || true
+
+# Write marker file
+touch ${FIRST_RUN_MARKER}
+echo "=================================================="
+echo "FIRST RUN SETUP COMPLETE"
+echo "=================================================="
